@@ -8,4 +8,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    preprocessing(".\\datasets\\books_cleaned.csv")
+    preprocessing(".\\datasets\\","books_cleaned.csv")

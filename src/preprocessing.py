@@ -1,6 +1,7 @@
 import pandas as pd
 
-def preprocessing(path):
-    df = pd.read_csv(path)
-    print(df)
+def preprocessing(path:str,file:str)->pd.DataFrame:
+    df = pd.read_csv(path+file)
+    print(df.head())
+    df['tagged_description'].to_csv(path+"tagged_description.txt")
     return df
