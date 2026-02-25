@@ -1,0 +1,38 @@
+steps:
+# Step 1: Build the Docker image using the Dockerfile
+- name: 'gcr.io/cloud-builders/docker'
+  args: [
+    'build',
+    '-t', 'us-central1-docker.pkg.dev/$PROJECT_ID/book-recommender-repo/book-recommender:$COMMIT_SHA',
+    '.'
+  ]
+
+# Step 2: Push the built image to Google Artifact Registry
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['push', 'us-central1-docker.pkg.dev/$PROJECT_ID/book-recommender-repo/book-recommender:$COMMIT_SHA']
+
+# Step 3: Deploy the new image to Google Cloud Run
+- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  entrypoint: gcloud
+  args:
+    - 'run'
+    - 'deploy'
+    - 'book-recommender-service'  # This will be the name of your public service
+    - '--image'
+    - 'us-central1-docker.pkg.dev/$PROJECT_ID/book-recommender-repo/book-recommender:$COMMIT_SHA'
+    - '--region'
+    - 'us-central1'               # You can choose a different region if you prefer
+    - '--platform'
+    - 'managed'
+    - '--allow-unauthenticated'     # This makes your service accessible to the public
+    - '--port'
+    - '7860'                      # The port your Gradio app uses
+    # This securely provides your OpenAI API key (from Secret Manager) to the running application
+    - '--update-secrets=OPENAI_API_KEY=openai-api-key:latest'
+
+# The built image is registered here
+images:
+- 'us-central1-docker.pkg.dev/$PROJECT_ID/book-recommender-repo/book-recommender:$COMMIT_SHA'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
