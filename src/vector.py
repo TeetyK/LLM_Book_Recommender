@@ -44,7 +44,7 @@ def get_retriever(force_recreate: bool = False):
     if not os.getenv("GOOGLE_API_KEY"):
         raise ValueError("GOOGLE_API_KEY not found in environment variables. Please create a .env file with this key.")
 
-    embeddings = GoogleGenerativeAIEmbeddings(model="embedding-001")
+    embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001")
     print("Initialized Google Generative AI Embeddings.")
 
     if force_recreate and os.path.exists(VECTORSTORE_PATH):
@@ -85,7 +85,7 @@ if __name__ == '__main__':
     print("\n--- Example Search ---")
     try:
         query = "A book about space travel and philosophy"
-        results = retriever.get_relevant_documents(query)
+        results = retriever.invoke(query)
         print(f"Top 5 results for the query: '{query}'")
         if results:
             for doc in results:
