@@ -132,7 +132,7 @@ posthog==5.4.0
 prometheus-client==0.24.1
 prompt-toolkit==3.0.52
 propcache==0.4.1
-protobuf==6.33.5
+protobuf==5.27.2
 psutil==7.2.2
 pure-eval==0.2.3
 pyasn1==0.6.2
@@ -162,7 +162,7 @@ requests-toolbelt==1.0.0
 rfc3339-validator==0.1.4
 rfc3986-validator==0.1.1
 rfc3987-syntax==1.1.0
-rich==14.3.3
+rich==13.7.1
 rpds-py==0.30.0
 rsa==4.9.1
 safetensors==0.7.0
@@ -177,7 +177,7 @@ sqlalchemy==2.0.47
 stack-data==0.6.3
 streamlit==1.37.0
 sympy==1.14.0
-tenacity==9.1.4
+tenacity==8.2.3
 terminado==0.18.1
 tinycss2==1.4.0
 tokenizers==0.22.2
