@@ -1,63 +1,79 @@
 import os
+import json
+import psycopg2
+from psycopg2 import extras
 import pandas as pd
 from typing import TypedDict, Annotated, Sequence
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 from langgraph.graph import StateGraph, END
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from langchain_community.vectorstores import Chroma
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_huggingface import HuggingFaceEmbeddings
 
 from nlp_utils import preprocess_text
 from database import query_database_tool, get_user_preferences
 
-# Constants from original main.py
-RAW_DATA_PATH = 'datasets/books.csv'
-CLEANED_DATA_PATH = 'datasets/books_cleaned.csv'
-VECTORSTORE_PATH = 'chroma_db_google'
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# --- 1. RAG Setup Logic Moved from main.py ---
-def preprocess_books_data():
-    if not os.path.exists(RAW_DATA_PATH):
-        print(f"Error: Not found {RAW_DATA_PATH}")
-        return False
+# --- 1. RAG Supabase Vector Retrieval ---
 
-    print("กำลังเตรียมข้อมูลหนังสือ...")
-    df = pd.read_csv(RAW_DATA_PATH, on_bad_lines='warn').head(5)
-    df['text_for_embedding'] = df.apply(lambda r:
-        f"Title: {r.get('title','')}\nAuthors: {r.get('authors','')}\n"
-        f"Categories: {r.get('categories','')}\nDesc: {r.get('description','')}", axis=1)
+def get_similar_books_from_supabase(query_text: str, k: int = 5) -> str:
+    """
+    Embeds the user query using HuggingFace and retrieves the top-k similar
+    books directly from Supabase's book_vectors table using pgvector's <=> operator.
+    Applies dimension padding (to 3072) to match the database vectors.
+    """
+    if not DATABASE_URL:
+        return "Error: DATABASE_URL not set."
 
-    os.makedirs('datasets', exist_ok=True)
-    df.to_csv(CLEANED_DATA_PATH, index=False)
-    return True
-
-def get_retriever():
-    if not os.path.exists(CLEANED_DATA_PATH):
-        if not preprocess_books_data(): return None
-
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
-    if not os.path.exists(VECTORSTORE_PATH):
-        print("กำลังสร้างฐานข้อมูล... (กำลังแบ่งส่งข้อมูลเพื่อไม่ให้เกิน Quota)")
-        df = pd.read_csv(CLEANED_DATA_PATH)
-        texts = df['text_for_embedding'].fillna("Unknown").tolist()
-        metadatas = df[['title', 'authors']].to_dict('records')
-
-        vectorstore = Chroma(
-            persist_directory=VECTORSTORE_PATH,
-            embedding_function=embeddings
+    try:
+        # 1. Initialize Embeddings
+        embeddings = HuggingFaceEmbeddings(
+            model_name="mixedbread-ai/mxbai-embed-large-v1"
         )
-        batch_size = 20
-        import time
-        for i in range(0, len(texts), batch_size):
-            batch_texts = texts[i : i + batch_size]
-            batch_meta = metadatas[i : i + batch_size]
-            vectorstore.add_texts(texts=batch_texts, metadatas=batch_meta)
-            time.sleep(5)
 
-        print("สร้างฐานข้อมูลเสร็จสมบูรณ์!")
-    else:
-        vectorstore = Chroma(persist_directory=VECTORSTORE_PATH, embedding_function=embeddings)
+        # 2. Embed the query
+        query_vector = embeddings.embed_query(query_text)
 
-    return vectorstore.as_retriever(search_kwargs={"k": 5})
+        # 3. Apply padding to match 3072 dimensions
+        target_dim = 3072
+        if len(query_vector) < target_dim:
+            query_vector = query_vector + [0.0] * (target_dim - len(query_vector))
+        elif len(query_vector) > target_dim:
+            query_vector = query_vector[:target_dim]
+
+        # 4. Format for pgvector
+        vector_str = "[" + ",".join([str(x) for x in query_vector]) + "]"
+
+        # 5. Connect and Query
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+
+        sql = f"""
+            SELECT content, metadata
+            FROM book_vectors
+            ORDER BY embedding <=> %s
+            LIMIT %s;
+        """
+        cur.execute(sql, (vector_str, k))
+        rows = cur.fetchall()
+
+        cur.close()
+        conn.close()
+
+        if not rows:
+            return "No matching books found in the database."
+
+        # 6. Format results
+        context_parts = []
+        for i, row in enumerate(rows):
+            content = row[0]
+            metadata = row[1] if row[1] else {}
+            title = metadata.get("title", "Unknown Title") if isinstance(metadata, dict) else "Unknown"
+            context_parts.append(f"Result {i+1}:\n{content}")
+
+        return "\n\n".join(context_parts)
+    except Exception as e:
+        return f"Error querying vector database: {e}"
 
 # --- 2. LangGraph Setup ---
 # Define State Schema
@@ -70,13 +86,30 @@ class GraphState(TypedDict):
 # Define Node: Intent Classification
 def router_node(state: GraphState):
     """
-    Decides if the query is for data/summarization (SQL Tool) or Book Recommendation.
+    Decides if the query is for data/summarization (SQL Tool) or Book Recommendation
+    using an LLM intent classifier.
     """
     messages = state["messages"]
-    latest_message = messages[-1].content.lower()
+    latest_message = messages[-1].content
 
-    # Simple keyword-based routing. Can be upgraded to LLM-based routing.
-    if any(keyword in latest_message for keyword in ["summarize", "data", "transactions", "database", "สรุปข้อมูล", "ข้อมูล user"]):
+    llm = ChatGoogleGenerativeAI(
+        model="models/gemini-2.5-flash",
+        google_api_key=os.getenv("GOOGLE_API_KEY"),
+        temperature=0
+    )
+
+    prompt = f"""You are an intent classifier for a book recommendation system.
+Determine if the user's message is asking to query data (like database stats, summaries, or user info) or if they are asking for book recommendations.
+Reply with EXACTLY one of the following words: "query_data" or "recommend_book".
+Do not include any other text.
+
+User's message: {latest_message}
+Intent:"""
+
+    response = llm.invoke(prompt)
+    intent_str = response.content.strip().lower()
+
+    if "query_data" in intent_str:
         intent = "query_data"
     else:
         intent = "recommend_book"
@@ -107,16 +140,14 @@ def recommendation_node(state: GraphState):
     # 1. Fetch User Preferences (Context)
     user_context = get_user_preferences(user_id)
 
-    # 2. NLP Preprocessing to reduce tokens
+    # 2. NLP Preprocessing to reduce tokens (simplified)
     processed_query = preprocess_text(latest_message)
 
-    # 3. RAG Retrieval
-    retriever = get_retriever()
-    if not retriever:
-        return {"response": "Error: Database not ready."}
+    # 3. RAG Retrieval from Supabase
+    doc_context = get_similar_books_from_supabase(processed_query, k=5)
 
-    docs = retriever.invoke(processed_query)
-    doc_context = "\n\n".join([doc.page_content for doc in docs])
+    if "Error" in doc_context:
+        return {"response": doc_context}
 
     # 4. LLM Generation
     llm = ChatGoogleGenerativeAI(
@@ -127,7 +158,8 @@ def recommendation_node(state: GraphState):
 
     prompt = f"""You are an expert book recommender.
 User Preferences/History Context: {user_context}
-Database Results Context: {doc_context}
+Database Results Context:
+{doc_context}
 User Question: {latest_message}
 
 Using both the user's history and the database context, suggest books. Answer in a friendly tone with bullet points:"""
