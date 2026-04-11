@@ -1,45 +1,35 @@
+import re
+from pythainlp import word_tokenize
+from pythainlp.corpus import thai_stopwords
 import nltk
 from nltk.corpus import stopwords
-from nltk.tokenize import word_tokenize
-from nltk.stem import WordNetLemmatizer
-import re
 
-# Ensure NLTK datasets are available (downloading might be required during first run)
+# โหลด Stop words ภาษาอังกฤษเผื่อไว้ (สำหรับชื่อหนังสือหรือคำทับศัพท์)
 try:
-    nltk.data.find('tokenizers/punkt')
-    nltk.data.find('tokenizers/punkt_tab')
     nltk.data.find('corpora/stopwords')
-    nltk.data.find('corpora/wordnet')
 except LookupError:
-    nltk.download('punkt', quiet=True)
-    nltk.download('punkt_tab', quiet=True)
     nltk.download('stopwords', quiet=True)
-    nltk.download('wordnet', quiet=True)
 
 def preprocess_text(text: str) -> str:
     """
-    Applies NLP techniques (tokenization, stop words removal, lemmatization)
-    to reduce the token count of a user query while retaining the core meaning.
-    Supports English texts primarily, useful for RAG queries.
+    ทำความสะอาดและตัดคำภาษาไทย + อังกฤษ เพื่อลด Token สำหรับ RAG
     """
     if not text:
         return ""
 
-    # 1. Lowercase and remove punctuation/special characters
-    text = re.sub(r'[^\w\s]', '', text.lower())
+    # 1. ลบอักขระพิเศษ แต่เก็บตัวอักษรไทย (ก-๙), อังกฤษ และตัวเลขไว้
+    text = re.sub(r'[^\w\sก-๙]', '', text.lower())
 
-    # 2. Tokenization
-    tokens = word_tokenize(text)
+    # 2. ตัดคำด้วย PyThaiNLP (engine='newmm' คือมาตรฐานที่ดีที่สุดตอนนี้)
+    # keep_whitespace=False เพื่อตัดช่องว่างทิ้ง
+    tokens = word_tokenize(text, engine='newmm', keep_whitespace=False)
 
-    # 3. Stop words removal
-    stop_words = set(stopwords.words('english'))
-    # Also add some common Thai stop words if needed, though NLTK focuses on English
-    # For a simple approach, we'll just filter English stopwords as LangChain RAG often works well with keywords
-    tokens = [word for word in tokens if word not in stop_words]
+    # 3. เตรียมชุดคำที่ไม่มีประโยชน์ (Stop words) ทั้งไทยและอังกฤษ
+    thai_stops = set(thai_stopwords())
+    eng_stops = set(stopwords.words('english'))
+    all_stops = thai_stops.union(eng_stops)
 
-    # 4. Lemmatization
-    lemmatizer = WordNetLemmatizer()
-    lemmatized_tokens = [lemmatizer.lemmatize(word) for word in tokens]
+    # 4. กรองคำที่อยู่ใน Stop words ออก
+    clean_tokens = [word for word in tokens if word not in all_stops]
 
-    # Return as a string suitable for searching
-    return " ".join(lemmatized_tokens)
+    return " ".join(clean_tokens)
