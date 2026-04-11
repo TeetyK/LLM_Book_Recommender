@@ -20,4 +20,5 @@ dependencies = [
     "pgvector>=0.4.2",
     "sentence-transformers>=5.4.0",
     "langchain-huggingface>=1.2.1",
+    "langchain-ollama>=1.1.0",
 ]

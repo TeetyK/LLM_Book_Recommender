@@ -1,190 +1,131 @@
 import os
-import json
-import psycopg2
-from psycopg2 import extras
-import pandas as pd
 from typing import TypedDict, Annotated, Sequence
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
+from langchain_core.messages import BaseMessage
 from langgraph.graph import StateGraph, END
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_ollama import ChatOllama
 
 from nlp_utils import preprocess_text
-from database import query_database_tool, get_user_preferences
+from database import get_similar_books, get_user_preferences, manage_postgres_data , add_prompt_history
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-# --- 1. RAG Supabase Vector Retrieval ---
-
-def get_similar_books_from_supabase(query_text: str, k: int = 5) -> str:
-    """
-    Embeds the user query using HuggingFace and retrieves the top-k similar
-    books directly from Supabase's book_vectors table using pgvector's <=> operator.
-    Applies dimension padding (to 3072) to match the database vectors.
-    """
-    if not DATABASE_URL:
-        return "Error: DATABASE_URL not set."
-
-    try:
-        # 1. Initialize Embeddings
-        embeddings = HuggingFaceEmbeddings(
-            model_name="mixedbread-ai/mxbai-embed-large-v1"
-        )
-
-        # 2. Embed the query
-        query_vector = embeddings.embed_query(query_text)
-
-        # 3. Apply padding to match 3072 dimensions
-        target_dim = 3072
-        if len(query_vector) < target_dim:
-            query_vector = query_vector + [0.0] * (target_dim - len(query_vector))
-        elif len(query_vector) > target_dim:
-            query_vector = query_vector[:target_dim]
-
-        # 4. Format for pgvector
-        vector_str = "[" + ",".join([str(x) for x in query_vector]) + "]"
-
-        # 5. Connect and Query
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
-
-        sql = f"""
-            SELECT content, metadata
-            FROM book_vectors
-            ORDER BY embedding <=> %s
-            LIMIT %s;
-        """
-        cur.execute(sql, (vector_str, k))
-        rows = cur.fetchall()
-
-        cur.close()
-        conn.close()
-
-        if not rows:
-            return "No matching books found in the database."
-
-        # 6. Format results
-        context_parts = []
-        for i, row in enumerate(rows):
-            content = row[0]
-            metadata = row[1] if row[1] else {}
-            title = metadata.get("title", "Unknown Title") if isinstance(metadata, dict) else "Unknown"
-            context_parts.append(f"Result {i+1}:\n{content}")
-
-        return "\n\n".join(context_parts)
-    except Exception as e:
-        return f"Error querying vector database: {e}"
-
-# --- 2. LangGraph Setup ---
-# Define State Schema
 class GraphState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], "messages"]
-    user_id: str
+    user_id: int
     intent: str
     response: str
 
-# Define Node: Intent Classification
+# ==========================================
+# ระบบ Fallback (Gemini -> Ollama)
+# ==========================================
+def call_llm_with_fallback(prompt_or_messages, tools=None):
+    """
+    ลองใช้ Gemini ก่อน ถ้า Error หรือ Quota เต็ม ให้สลับไปใช้ Ollama อัตโนมัติ
+    """
+    try:
+        # ลองเรียก Gemini
+        llm = ChatGoogleGenerativeAI(
+            model="models/gemini-2.5-flash",
+            google_api_key=os.getenv("GOOGLE_API_KEY"),
+            temperature=0.3
+        )
+        if tools:
+            llm = llm.bind_tools(tools)
+            
+        return llm.invoke(prompt_or_messages)
+        
+    except Exception as e:
+        print(f"\n⚠️ Gemini ไม่พร้อมใช้งาน ({e})\n🔄 กำลังสลับไปใช้ Local Ollama (book_qwen)...")
+        
+        llm_ollama = ChatOllama(
+            model="book_qwen",
+            temperature=0.3
+        )
+        if tools:
+            llm_ollama = llm_ollama.bind_tools(tools)
+            
+        return llm_ollama.invoke(prompt_or_messages)
+
+# ==========================================
+# Nodes ของ LangGraph
+# ==========================================
 def router_node(state: GraphState):
-    """
-    Decides if the query is for data/summarization (SQL Tool) or Book Recommendation
-    using an LLM intent classifier.
-    """
+    """วิเคราะห์ความตั้งใจ และบันทึกประวัติทันทีที่ข้อความเข้าระบบ"""
     messages = state["messages"]
     latest_message = messages[-1].content
+    user_id = state.get("user_id")
 
-    llm = ChatGoogleGenerativeAI(
-        model="models/gemini-2.5-flash",
-        google_api_key=os.getenv("GOOGLE_API_KEY"),
-        temperature=0
-    )
+    # 🌟 จุดแก้สำคัญ: บันทึกประวัติตั้งแต่จุดเริ่มต้นของ Graph
+    if user_id:
+        print(f"DEBUG: Saving prompt for User {user_id}: {latest_message}")
+        add_prompt_history(user_id, latest_message)
 
-    prompt = f"""You are an intent classifier for a book recommendation system.
-Determine if the user's message is asking to query data (like database stats, summaries, or user info) or if they are asking for book recommendations.
-Reply with EXACTLY one of the following words: "query_data" or "recommend_book".
-Do not include any other text.
-
-User's message: {latest_message}
-Intent:"""
-
-    response = llm.invoke(prompt)
-    intent_str = response.content.strip().lower()
-
-    if "query_data" in intent_str:
-        intent = "query_data"
-    else:
-        intent = "recommend_book"
-
-    return {"intent": intent}
+    # ส่วนของ Logic การแยก Intent เดิม
+    msg_lower = latest_message.lower()
+    db_keywords = ["summarize", "data", "database", "ค้นหาข้อมูล", "เรทติ้ง", "สรุป"]
+    if any(keyword in msg_lower for keyword in db_keywords):
+        return {"intent": "query_data"}
+    return {"intent": "recommend_book"}
 
 def route_intent(state: GraphState):
-    if state["intent"] == "query_data":
-        return "sql_query_node"
+    if state["intent"] == "query_data": return "sql_query_node"
     return "recommendation_node"
 
-# Define Node: SQL Query Tool
 def sql_query_node(state: GraphState):
-    messages = state["messages"]
-    latest_message = messages[-1].content
+    latest_message = state["messages"][-1].content
+    
+    prompt = f"User request: '{latest_message}'. Use manage_postgres_data tool to find the answer."
+    
+    # ใช้ฟังก์ชัน Fallback ของเราแทนการเรียก LLM ตรงๆ (พร้อมแนบ Tools)
+    ai_msg = call_llm_with_fallback(prompt, tools=[manage_postgres_data])
+    
+    if ai_msg.tool_calls:
+        tool_call = ai_msg.tool_calls[0]
+        tool_result = manage_postgres_data.invoke(tool_call["args"])
+        
+        summary_prompt = f"คำถามผู้ใช้: {latest_message}\nผลจาก Database SQL: {tool_result}\nจงสรุปคำตอบให้ผู้ใช้อ่านเข้าใจง่าย"
+        # ใช้ Fallback ตอนสรุปผลด้วย (เผื่อพังตอนจะสรุป)
+        final_answer = call_llm_with_fallback(summary_prompt)
+        return {"response": final_answer.content}
+    
+    return {"response": ai_msg.content}
 
-    # Call the MCP Tool
-    result = query_database_tool.invoke({"query_intent": latest_message})
-
-    return {"response": result}
-
-# Define Node: Recommendation (RAG + User Context)
 def recommendation_node(state: GraphState):
-    messages = state["messages"]
-    latest_message = messages[-1].content
-    user_id = state.get("user_id", "default_user")
+    latest_message = state["messages"][-1].content
+    user_id = state.get("user_id")
 
-    # 1. Fetch User Preferences (Context)
-    user_context = get_user_preferences(user_id)
+    # 🌟 1. แอบบันทึก Prompt ของผู้ใช้ลงฐานข้อมูล (ทำก่อนเลย!)
+    if user_id:
+        add_prompt_history(user_id, latest_message)
 
-    # 2. NLP Preprocessing to reduce tokens (simplified)
+    # 2. ดึงประวัติของคนนี้มาดู (ตอนนี้มันจะรวมถึงสิ่งที่เพิ่งพิมพ์เมื่อกี้ด้วย!)
+    user_context = get_user_preferences(user_id) if user_id else "ไม่มีข้อมูลประวัติ"
+
+    # 3. เตรียม NLP และค้นหา Vector
     processed_query = preprocess_text(latest_message)
+    search_query = processed_query if processed_query else latest_message 
 
-    # 3. RAG Retrieval from Supabase
-    doc_context = get_similar_books_from_supabase(processed_query, k=5)
+    # (ตรงนี้คือโค้ดเดิมที่เรียกใช้ get_similar_books และ AI ตามปกติ)
+    doc_context = get_similar_books(search_query, user_id=user_id, k=5)
 
-    if "Error" in doc_context:
-        return {"response": doc_context}
+    prompt = f"""ความสนใจของผู้ใช้: {user_context}
+ข้อมูลหนังสือจาก Database: {doc_context}
+คำถามของผู้ใช้: {latest_message}
 
-    # 4. LLM Generation
-    llm = ChatGoogleGenerativeAI(
-        model="models/gemini-2.5-flash",
-        google_api_key=os.getenv("GOOGLE_API_KEY"),
-        temperature=0.3
-    )
+หน้าที่ของคุณคือเลือกหนังสือจาก 'ข้อมูลหนังสือ' ให้ตอบโจทย์คำถามผู้ใช้โดยอิงจาก 'ความสนใจของผู้ใช้' ด้วย (ถ้ามี)"""
 
-    prompt = f"""You are an expert book recommender.
-User Preferences/History Context: {user_context}
-Database Results Context:
-{doc_context}
-User Question: {latest_message}
-
-Using both the user's history and the database context, suggest books. Answer in a friendly tone with bullet points:"""
-
-    response = llm.invoke(prompt)
+    response = call_llm_with_fallback(prompt)
     return {"response": response.content}
 
-
-# --- Build Graph ---
+# ==========================================
+# สร้าง Workflow
+# ==========================================
 workflow = StateGraph(GraphState)
-
 workflow.add_node("router", router_node)
 workflow.add_node("sql_query_node", sql_query_node)
 workflow.add_node("recommendation_node", recommendation_node)
 
 workflow.set_entry_point("router")
-workflow.add_conditional_edges(
-    "router",
-    route_intent,
-    {
-        "sql_query_node": "sql_query_node",
-        "recommendation_node": "recommendation_node",
-    }
-)
-
+workflow.add_conditional_edges("router", route_intent)
 workflow.add_edge("sql_query_node", END)
 workflow.add_edge("recommendation_node", END)
 
